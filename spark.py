@@ -256,6 +256,9 @@ def _find_in_chat_list(page: Page, name: str) -> list[Locator]:
 
 
 def open_friend(page: Page, name: str) -> None:
+    if name in FRIEND_SECS:
+        _open_by_sec_uid(page, name, FRIEND_SECS[name])
+        return
     search = first_visible(page, SEARCH)
     chat_list = page.locator(".conversationConversationListwrapper").first
     if chat_list.count() and not chat_list.is_visible():
@@ -283,6 +286,11 @@ def open_friend(page: Page, name: str) -> None:
     row = matches[0]
     button = row.locator('[class*="SearchPanelitemchat_btn"]').first
     (button if button.count() and button.is_visible() else row).click()
+    _confirm_chat_header(page, name)
+
+
+def _confirm_chat_header(page: Page, name: str, label: str = "") -> None:
+    label = label or name
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         for selector in HEADERS:
@@ -297,7 +305,93 @@ def open_friend(page: Page, name: str) -> None:
                             first_visible(page, EDITORS, 3000)
                             return
         page.wait_for_timeout(300)
-    raise SparkError(f"无法确认当前聊天属于“{name}”，已停止发送", reason="recipient")
+    raise SparkError(f"无法确认当前聊天属于“{label}”，已停止发送", reason="recipient")
+
+
+# ---- 按永久用户编号 sec_uid 定位好友（Fairc11 fork 新增） ----
+# data/friend_ids.json 由 map_friends.py 生成：[{"douyin_id": "...", "sec_uid": "..."}]。
+# config.json 的 friends 填抖音号；抖音号在此映射里时，按 sec_uid 在私信列表中找会话，
+# 读出当前显示名，只在本次运行内存中使用，用来核对聊天窗口标题。
+
+FRIEND_SECS: dict[str, str] = {}
+SEC_UID_RE = re.compile(r"[A-Za-z0-9_-]{20,200}")
+SEC_UIDS_JS = """() => Array.from(document.querySelectorAll('[data-e2e="conversation-item"]')).map(r => {
+  let f = r[Object.keys(r).find(k => k.startsWith('__reactFiber'))];
+  for (let i = 0; i < 6 && f; i++, f = f.return) {
+    const c = f.memoizedProps && f.memoizedProps.conversation;
+    if (c) return c.toParticipantSecUserId || '';
+  }
+  return '';
+})"""
+
+
+def _validate_friend_ids(entries: object) -> dict[str, str]:
+    if not isinstance(entries, list):
+        raise SparkError("friend_ids.json 必须是列表")
+    mapping: dict[str, str] = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            raise SparkError("friend_ids.json 条目格式错误")
+        douyin_id, sec = item.get("douyin_id"), item.get("sec_uid")
+        if (not isinstance(douyin_id, str) or not douyin_id.strip() or douyin_id != douyin_id.strip()
+                or not isinstance(sec, str) or not SEC_UID_RE.fullmatch(sec)):
+            raise SparkError("friend_ids.json 条目格式错误")
+        if douyin_id in mapping or sec in mapping.values():
+            raise SparkError("friend_ids.json 有重复的抖音号或编号")
+        mapping[douyin_id] = sec
+    return mapping
+
+
+def load_friend_ids(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    return _validate_friend_ids(json.loads(path.read_text(encoding="utf-8")))
+
+
+def write_friend_ids(path: Path, entries: list[dict]) -> None:
+    _validate_friend_ids(entries)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(entries, ensure_ascii=False, indent=1), encoding="utf-8")
+    temp.chmod(0o600)
+    os.replace(temp, path)
+
+
+def _open_by_sec_uid(page: Page, label: str, sec: str) -> None:
+    chat_list = page.locator(".conversationConversationListwrapper").first
+    if not chat_list.count() or not chat_list.is_visible():
+        load_chat(page)
+        chat_list = page.locator(".conversationConversationListwrapper").first
+    if chat_list.count():
+        chat_list.evaluate("el => { el.scrollTop = 0 }")
+        page.wait_for_timeout(400)
+    bottom_passes = 0
+    for _ in range(300):
+        secs = page.evaluate(SEC_UIDS_JS)
+        hits = [index for index, value in enumerate(secs) if value == sec]
+        if len(hits) > 1:
+            raise SparkError(f"好友“{label}”匹配到多个聊天", reason="ambiguous")
+        if hits:
+            row = page.locator(CHAT_ROWS[0]).nth(hits[0])
+            row.scroll_into_view_if_needed()
+            names = [n.strip() for n in row.locator(".conversationConversationItemtitle").all_inner_texts()
+                     if n.strip()]
+            if len(names) != 1:
+                raise SparkError(f"好友“{label}”的会话名称无法读取", reason="recipient")
+            current_name = re.sub(r"\s*\(\d+\)$", "", names[0])
+            row.click()
+            _confirm_chat_header(page, current_name, label)
+            return
+        if not chat_list.count():
+            break
+        top, height, viewport = chat_list.evaluate(
+            "el => [el.scrollTop, el.scrollHeight, el.clientHeight]")
+        bottom_passes = bottom_passes + 1 if top + viewport >= height - 2 else 0
+        if bottom_passes >= 3:
+            break
+        chat_list.evaluate("(el, step) => { el.scrollTop += step }", max(250, viewport * 0.7))
+        page.wait_for_timeout(450)
+    raise SparkError(f"私信列表中没有找到好友“{label}”的会话", reason="recipient")
 
 
 def _visible_inside(scope: Locator, selectors: tuple[str, ...]) -> bool:
@@ -534,6 +628,8 @@ def run(config: dict, auth: Path, data_dir: Path, dry_run: bool,
 def _run_chats(config: dict, auth: Path, data_dir: Path, dry_run: bool, report: Report) -> int:
     if not auth.exists():
         raise SparkError("缺少登录文件", reason="login")
+    FRIEND_SECS.clear()
+    FRIEND_SECS.update(load_friend_ids(data_dir / "friend_ids.json"))
     ledger = Ledger(data_dir / "sends.sqlite3")
     try:
         with sync_playwright() as playwright:
