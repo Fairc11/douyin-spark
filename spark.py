@@ -7,6 +7,7 @@ import fcntl
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import sys
@@ -79,6 +80,10 @@ def validate_config(config: object) -> dict:
     message = config.get("message")
     if not isinstance(message, dict) or message.get("type") not in {"text", "sticker"}:
         raise SparkError("message.type 只能是 text 或 sticker")
+    pause = config.get("pause_seconds", [0, 0])
+    if (not isinstance(pause, list) or len(pause) != 2
+            or not all(isinstance(x, int) and 0 <= x <= 300 for x in pause) or pause[0] > pause[1]):
+        raise SparkError("pause_seconds 需为 [最小, 最大]，0 到 300 秒")
     value = message.get("value")
     if not isinstance(value, str) or not value.strip() or len(value) > 200:
         raise SparkError("message.value 需为 1 到 200 字的内容或表情名称")
@@ -289,9 +294,21 @@ def open_friend(page: Page, name: str) -> None:
     _confirm_chat_header(page, name)
 
 
+HEADER_TIMEOUT_S = 45  # 服务器只有 1 个 CPU，打开聊天可能较慢
+
+
+def _pause(page: Page, config: dict) -> None:
+    """好友之间随机停顿；config.json 可选 "pause_seconds": [最小, 最大]，默认不停顿。"""
+    low, high = config.get("pause_seconds", [0, 0])
+    seconds = random.randint(low, high)
+    if seconds:
+        LOGGER.info("停顿 %s 秒", seconds)
+        page.wait_for_timeout(seconds * 1000)
+
+
 def _confirm_chat_header(page: Page, name: str, label: str = "") -> None:
     label = label or name
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + HEADER_TIMEOUT_S
     while time.monotonic() < deadline:
         for selector in HEADERS:
             heads = page.locator(selector)
@@ -638,12 +655,15 @@ def _run_chats(config: dict, auth: Path, data_dir: Path, dry_run: bool, report: 
                 context = browser.new_context(storage_state=str(auth), locale="zh-CN")
                 page = context.new_page()
                 load_chat(page)
+                page.wait_for_timeout(3000)
                 report.access = "ok"
                 day = report.started[:10]
                 errors = 0
                 pending: list[tuple[str, int, set[str]]] = []
-                for friend in config["friends"]:
+                for index, friend in enumerate(config["friends"]):
                     claimed = False
+                    if index:
+                        _pause(page, config)
                     try:
                         open_friend(page, friend)
                         if dry_run:
@@ -668,7 +688,9 @@ def _run_chats(config: dict, auth: Path, data_dir: Path, dry_run: bool, report: 
                         errors += 1
                         if claimed:
                             ledger.mark(day, friend, "uncertain")
-                for friend, before, ids in pending:
+                for index, (friend, before, ids) in enumerate(pending):
+                    if index:
+                        _pause(page, config)
                     try:
                         verify_after_reload(page, friend, config["message"], before, ids)
                         ledger.mark(day, friend, "sent")
