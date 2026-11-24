@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 import re
@@ -10,6 +11,7 @@ import subprocess
 import secrets
 import tempfile
 import threading
+from datetime import datetime, timezone
 from email.header import Header
 from urllib.parse import urlencode
 
@@ -86,9 +88,10 @@ def configure_channel(path: Path, action: str, supplied: str = "") -> str:
 
 def publish(kind: str, count: int = 0, account: str = "", *, topic_file: Path | None = None) -> bool:
     url = configured_url(topic_file)
-    if not url:
+    if not url and not discord_url():
         return False
-    validate_url(url)
+    if url:
+        validate_url(url)
     if kind == "test":
         body = "服务器通知已接通。"
     elif kind == "success":
@@ -98,7 +101,76 @@ def publish(kind: str, count: int = 0, account: str = "", *, topic_file: Path | 
     return send_notice(url, "Douyin spark", body, 4 if kind not in {"test", "success"} else 3)
 
 
+DISCORD_URL_PATH = ROOT / "data" / "discord_url"
+DISCORD_HOSTS = {"discord.com", "discordapp.com"}
+
+
+def discord_url() -> str:
+    """Return the Discord webhook URL from data/discord_url, or "" when not set."""
+    url = configured_url(DISCORD_URL_PATH)
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    if (parts.scheme != "https" or parts.netloc not in DISCORD_HOSTS
+            or not re.fullmatch(r"/api/webhooks/\d+/[A-Za-z0-9_-]+", parts.path)
+            or parts.query or parts.fragment):
+        raise ValueError("data/discord_url 不是有效的 Discord webhook 地址")
+    return url
+
+
+def send_discord(url: str, title: str, body: str, priority: int) -> bool:
+    payload = {
+        "username": "续火花助手",
+        "embeds": [{
+            "title": title[:256],
+            "description": body[:4000],
+            "color": 0xE74C3C if priority >= 4 else 0x2ECC71,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }],
+        "allowed_mentions": {"parse": []},
+    }
+    # Discord 前置的 Cloudflare 会拒绝 urllib 默认的 User-Agent，必须自带一个。
+    request = Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                      headers={"Content-Type": "application/json",
+                               "User-Agent": "DiscordBot (https://github.com/Fairc11/douyin-spark, 1.0)"},
+                      method="POST")
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=10) as response:
+                if response.status not in (200, 204):
+                    raise RuntimeError(f"Discord 返回 HTTP {response.status}")
+            print("Discord 已接受通知")
+            return True
+        except (HTTPError, URLError, TimeoutError) as exc:
+            if attempt == 2:
+                raise RuntimeError(f"Discord 通知发送失败：{exc}") from exc
+            time.sleep(1 + attempt)
+
+
 def send_notice(url: str, title: str, body: str, priority: int, click: str = "") -> bool:
+    """Send to ntfy (when url is set) and to Discord (when data/discord_url is set).
+
+    Raises only when every configured channel failed.
+    """
+    sent = False
+    errors: list[str] = []
+    if url:
+        try:
+            sent = _send_ntfy(url, title, body, priority, click) or sent
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    target = discord_url()
+    if target:
+        try:
+            sent = send_discord(target, title, body, priority) or sent
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    if not sent and errors:
+        raise RuntimeError("；".join(errors))
+    return sent
+
+
+def _send_ntfy(url: str, title: str, body: str, priority: int, click: str = "") -> bool:
     headers = {"Title": Header(title, "utf-8").encode(maxlinelen=998),
                "Priority": str(priority), "Tags": "warning" if priority == 4 else "information_source"}
     if click:
@@ -131,7 +203,7 @@ def finish(report: Report, directory: Path, topic_file: Path | None) -> None:
     all_previously_handled = all(result.startswith("previous_") for result in report.results.values())
     if report.kind == "daily" and all_previously_handled and not report.problem:
         notice = None
-    if url and notice:
+    if notice and (url or discord_url()):
         link_file = ROOT / "data" / "dashboard_url"
         link = link_file.read_text().strip() if link_file.is_file() else ""
         if link:
@@ -161,7 +233,7 @@ def service_failure(kind: str) -> None:
                 finish(Report(**record), directory, None)
             return
     url = configured_url()
-    if url:
+    if url or discord_url():
         send_notice(url, "定时任务未能完成", f"{LABELS[kind]}没有生成完整结果，请查看服务日志。", 4)
 
 
